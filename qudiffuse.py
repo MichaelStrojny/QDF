@@ -25,39 +25,115 @@ def stochastic_binarize(x: torch.Tensor) -> torch.Tensor:
     rand = torch.rand_like(prob)
     return (rand < prob).float()
 
+
+def _norm(ch: int) -> nn.Module:
+    """Simple GroupNorm used for residual blocks."""
+    return nn.GroupNorm(8, ch)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int = None):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.norm1 = _norm(in_channels)
+        self.norm2 = _norm(out_channels)
+        self.skip = (
+            nn.Conv2d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class AttnBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = _norm(channels)
+        self.q = nn.Conv2d(channels, channels, 1)
+        self.k = nn.Conv2d(channels, channels, 1)
+        self.v = nn.Conv2d(channels, channels, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        q = self.q(h)
+        k = self.k(h)
+        v = self.v(h)
+        b, c, h_, w_ = q.shape
+        q = q.reshape(b, c, h_ * w_).permute(0, 2, 1)
+        k = k.reshape(b, c, h_ * w_)
+        w = torch.bmm(q, k) * (c ** -0.5)
+        w = torch.softmax(w, dim=-1)
+        v = v.reshape(b, c, h_ * w_)
+        w = w.permute(0, 2, 1)
+        h = torch.bmm(v, w).reshape(b, c, h_, w_)
+        h = self.proj(h)
+        return x + h
+
+
+class Downsample(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)
+
 class BinaryAutoencoder(nn.Module):
-    def __init__(self, input_channels: int, latent_dim: int):
+    """Improved binary autoencoder with residual and attention blocks."""
+
+    def __init__(self, input_channels: int, latent_dim: int, base_channels: int = 64):
         super().__init__()
         self.latent_dim = latent_dim
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-        )
-        self.enc_fc = nn.Linear(512 * 2 * 2, latent_dim)
-        self.decoder_fc = nn.Linear(latent_dim, 512 * 2 * 2)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, input_channels, kernel_size=4, stride=2, padding=1),
+        ch = base_channels
+        self.final_channels = ch * 8
+
+        enc_layers = [
+            nn.Conv2d(input_channels, ch, kernel_size=4, stride=2, padding=1),
+            ResBlock(ch),
+            nn.Conv2d(ch, ch * 2, kernel_size=4, stride=2, padding=1),
+            ResBlock(ch * 2),
+            nn.Conv2d(ch * 2, ch * 4, kernel_size=4, stride=2, padding=1),
+            ResBlock(ch * 4),
+            nn.Conv2d(ch * 4, ch * 8, kernel_size=4, stride=2, padding=1),
+            ResBlock(ch * 8),
+            AttnBlock(ch * 8),
+        ]
+        self.encoder = nn.Sequential(*enc_layers)
+
+        self.enc_fc = nn.Linear(self.final_channels * 2 * 2, latent_dim)
+        self.decoder_fc = nn.Linear(latent_dim, self.final_channels * 2 * 2)
+
+        dec_layers = [
+            ResBlock(ch * 8),
+            AttnBlock(ch * 8),
+            Upsample(ch * 8),
+            ResBlock(ch * 8, ch * 4),
+            Upsample(ch * 4),
+            ResBlock(ch * 4, ch * 2),
+            Upsample(ch * 2),
+            ResBlock(ch * 2, ch),
+            Upsample(ch),
+            nn.Conv2d(ch, input_channels, kernel_size=3, padding=1),
             nn.Sigmoid(),
-        )
+        ]
+        self.decoder = nn.Sequential(*dec_layers)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)
@@ -72,7 +148,7 @@ class BinaryAutoencoder(nn.Module):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         h = self.decoder_fc(z)
-        h = h.view(h.size(0), 512, 2, 2)
+        h = h.view(h.size(0), self.final_channels, 2, 2)
         x_recon = self.decoder(h)
         return x_recon
 
