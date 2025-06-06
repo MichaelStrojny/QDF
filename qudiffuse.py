@@ -232,16 +232,19 @@ class DBN(nn.Module):
         return h
 
     def pretrain(self, data: torch.Tensor, epochs: int = 10, lr: float = 1e-3, k: int = 1, batch_size: int = 64):
-        dataset = torch.utils.data.TensorDataset(data)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        """Layer-wise contrastive divergence pretraining."""
         v = data
         for idx, rbm in enumerate(self.rbms):
+            dataset = torch.utils.data.TensorDataset(v)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             for epoch in range(epochs):
                 for batch in loader:
                     v_batch = batch[0]
                     rbm.contrastive_divergence(v_batch, k=k, lr=lr)
                 print(f"RBM {idx} epoch {epoch} done")
-            v = rbm(v).detach()
+            # propagate data through trained layer for next RBM
+            with torch.no_grad():
+                v = rbm(v)
 
     def estimate_prior(self, data: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         with torch.no_grad():
