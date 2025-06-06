@@ -76,18 +76,18 @@ class BinaryAutoencoder(nn.Module):
         x_recon = self.decoder(h)
         return x_recon
 
-    def forward(self, x: torch.Tensor, stochastic: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, stochastic: bool = True):
         h = self.encode(x)
         z = self.binarize(h, stochastic=stochastic)
         x_recon = self.decode(z)
-        return x_recon, z
+        return x_recon, z, h
 
 
-def autoencoder_loss(x: torch.Tensor, x_recon: torch.Tensor, z: torch.Tensor,
+def autoencoder_loss(x: torch.Tensor, x_recon: torch.Tensor, logits: torch.Tensor,
                      prior_prob: float = 0.5, kl_weight: float = 1e-2,
                      ent_weight: float = 1e-3) -> torch.Tensor:
     recon_loss = F.mse_loss(x_recon, x)
-    q_prob = torch.sigmoid(z)
+    q_prob = torch.sigmoid(logits)
     prior = torch.full_like(q_prob, prior_prob)
     kl = F.kl_div(q_prob.log(), prior, reduction="batchmean")
     entropy = -(q_prob * q_prob.log() + (1 - q_prob) * (1 - q_prob).log()).mean()
@@ -257,19 +257,25 @@ def train_autoencoder(autoencoder: BinaryAutoencoder, dataloader, epochs: int = 
     for epoch in range(epochs):
         for x, in dataloader:
             x = x.to(device)
-            x_recon, z = autoencoder(x)
-            loss = autoencoder_loss(x, x_recon, z)
+            x_recon, z, logits = autoencoder(x)
+            loss = autoencoder_loss(x, x_recon, logits)
             opt.zero_grad()
             loss.backward()
             opt.step()
         print(f'Epoch {epoch} AE loss {loss.item():.4f}')
 
 
-def train_dbn(dbn: DBN, dataloader, epochs: int = 10, lr: float = 1e-3, k: int = 1, device: str = 'cuda'):
-    data = []
-    for x, in dataloader:
-        data.append(x.view(x.size(0), -1))
-    data = torch.cat(data, dim=0).to(device)
+def train_dbn(dbn: DBN, autoencoder: BinaryAutoencoder, dataloader, epochs: int = 10,
+              lr: float = 1e-3, k: int = 1, device: str = 'cuda'):
+    autoencoder.to(device)
+    autoencoder.eval()
+    codes = []
+    with torch.no_grad():
+        for x, in dataloader:
+            x = x.to(device)
+            h = autoencoder.encode(x)
+            codes.append(torch.sigmoid(h))
+    data = torch.cat(codes, dim=0)
     dbn.pretrain(data, epochs=epochs, lr=lr, k=k)
 
 if __name__ == '__main__':
@@ -299,7 +305,7 @@ if __name__ == '__main__':
         train_autoencoder(autoencoder, loader, epochs=args.epochs, device=device)
     dbn = DBN([1024, 2048, 2048])
     if not args.generate:
-        train_dbn(dbn, loader, epochs=args.epochs, device=device)
+        train_dbn(dbn, autoencoder, loader, epochs=args.epochs, device=device)
 
     diffusion = BinaryDiffusion(args.timesteps)
 
