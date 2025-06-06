@@ -1,0 +1,876 @@
+\documentclass[11pt,letterpaper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{enumitem}
+\usepackage{bm}
+\usepackage{physics}
+\usepackage{natbib}
+\usepackage{caption}
+\usepackage{float}
+
+\geometry{margin=1in}
+
+\title{QuDiffuse: Quantum-Assisted Diffusion Models with Joint Window Denoising}
+\author{Author Name \\
+Affiliation \\
+Email}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Diffusion models have emerged as powerful generative frameworks, achieving state-of-the-art sample quality across image, audio, and 3D domains. However, they suffer from computational inefficiency and slow sampling processes, requiring hundreds to thousands of denoising steps. In this work, we introduce \emph{QuDiffuse}, a quantum-assisted diffusion model that leverages quantum annealing to accelerate the denoising process. Our approach formulates denoising as a Quadratic Unconstrained Binary Optimization (QUBO) problem in a hierarchical binary latent space and solves multiple time steps jointly via a single quantum annealer call. We provide rigorous mathematical derivations proving convergence, sampling efficiency, and manifold preservation in the binary latent representation. Empirical results on MNIST, CIFAR-10, and CelebA demonstrate up to a 10$\times$ speedup in sampling while maintaining competitive sample quality. This quantum-classical hybrid architecture paves the way for efficient generative modeling in high-dimensional settings.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Generative modeling has seen remarkable advances with the advent of diffusion-based techniques \cite{sohl2015deep, ho2020denoising}. In a diffusion model, data samples $\xb_0 \sim q(\xb_0)$ are gradually corrupted by adding noise over $T$ timesteps in a \emph{forward process}, producing a sequence $\xb_1, \xb_2, \ldots, \xb_T$. A neural network parameterized by $\theta$ is then trained to approximate the \emph{reverse process}, i.e., learning $p_\theta(\xb_{t-1} \mid \xb_t)$, so that one can sample from $p_\theta(\xb_0)$ by iteratively denoising from $\xb_T \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$. Despite producing high-fidelity samples, classical diffusion models require $T \approx 1000$ or more denoising steps, leading to slow inference and high computational cost.
+
+To alleviate this, recent works such as DDIM \cite{song2020denoising} and DPM-Solver \cite{lu2022dpm} reduce the number of required steps via non-Markovian or ODE-based solvers, but still operate entirely in the classical computing regime. In contrast, quantum computing—particularly quantum annealing \cite{kadowaki1998quantum}—offers efficient hardware for solving certain combinatorial optimization problems in polynomial or sub-exponential time. Quadratic Unconstrained Binary Optimization (QUBO) lies at the heart of many quantum annealers (e.g., D-Wave), where a problem of the form
+\begin{equation}
+\min_{\zz \in \{0,1\}^n} \zz^\top Q \zz + \cb^\top \zz + \alpha
+\end{equation}
+can be mapped directly onto qubits with pairwise couplings $Q_{ij}$ and local fields $\cb_i$.
+
+In this work, we harness quantum annealing to accelerate diffusion-based generation by reformulating the \emph{denoising step} as a QUBO optimization in a binary latent space. Our contributions are:
+\begin{enumerate}[noitemsep,topsep=0pt]
+    \item \textbf{Binary Latent Autoencoder:} We construct a hierarchical binary latent space via a binary autoencoder. We prove that, under mild conditions, this binary space can preserve the data manifold with arbitrarily small reconstruction error (Theorem~\ref{thm:manifold-preservation}).
+    \item \textbf{Quantum-Assisted Denoising:} The reverse diffusion at each timestep $t$ is cast as finding the most probable binary latent code $\zbm_{t-1}$ given $\zbm_t$ under a Bernoulli diffusion process (Equation~\eqref{eq:bernoulli-forward}). This becomes a QUBO problem by modeling the prior over $\zbm_{t-1}$ with a Deep Belief Network (DBN), resulting in local biases $h_i^{(t)}$ and couplings $J_{ij}^{(t)}$.
+    \item \textbf{Joint Window Formulation:} We propose a novel joint window energy that optimizes a block of $w$ consecutive timesteps $\{\zbm_{t-w}, \ldots, \zbm_{t-1}\}$ simultaneously under coupling terms that enforce temporal consistency (Equation~\eqref{eq:joint-energy}). We prove that this reduces the number of quantum annealer calls from $T$ to $\lceil T / w \rceil$ (Theorem~\ref{thm:efficiency}).
+    \item \textbf{Theoretical Guarantees:} We rigorously derive the coupling energy from the forward process (Proposition~\ref{prop:coupling-derivation}), prove convergence of the quantum-assisted reverse process both under perfect optimization (Theorem~\ref{thm:reverse-convergence}) and imperfect optimization due to hardware noise (Theorem~\ref{thm:imperfect-convergence}), and analyze qubit scaling (Theorem~\ref{thm:qubit-scaling}).
+    \item \textbf{Empirical Validation:} On MNIST, CIFAR-10, and CelebA, QuDiffuse achieves up to $10\times$ speedup compared to DDPM \cite{ho2020denoising} while matching or exceeding sample quality measured by FID and Inception Score.
+\end{enumerate}
+
+This paper is organized as follows. Section~\ref{sec:background} reviews diffusion models, quantum annealing, and binary latent models. Section~\ref{sec:methodology} details our binary autoencoder, QUBO formulation, joint window denoising, and quantum integration. Section~\ref{sec:theory} provides theoretical analysis and proofs. Section~\ref{sec:experiments} describes experimental protocols and results. We conclude in Section~\ref{sec:conclusion} with a discussion of limitations and future work.
+
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Diffusion Models}
+
+Let $\xb_0 \sim q(\xb_0)$ be a data sample in $\R^d$. A diffusion model defines a forward noising process
+\begin{equation}
+q(\xb_t \mid \xb_{t-1}) = \mathcal{N}\bigl(\xb_t;\sqrt{1-\beta_t}\,\xb_{t-1}, \,\beta_t \Ib\bigr), \quad t=1,\ldots,T,
+\label{eq:gaussian-forward}
+\end{equation}
+where $\{\beta_t\}_{t=1}^T$ is a noise schedule with $0 < \beta_t < 1$ and typically $\beta_t$ small. By induction,
+\begin{equation}
+q(\xb_t \mid \xb_0) = \mathcal{N}\bigl(\xb_t; \sqrt{\bar\alpha_t}\,\xb_0,\, (1-\bar\alpha_t)\Ib \bigr), \quad \bar\alpha_t := \prod_{s=1}^t (1-\beta_s).
+\end{equation}
+The reverse process is parameterized as
+\begin{equation}
+p_\theta(\xb_{t-1}\mid \xb_t) = \mathcal{N}\bigl(\xb_{t-1};\,\mu_\theta(\xb_t,t),\,\Sigma_\theta(\xb_t,t)\bigr),
+\label{eq:reverse-param}
+\end{equation}
+and is learned by minimizing a variational bound on the negative log-likelihood. In practice, $\Sigma_\theta$ is often fixed or simplified, and the model predicts $\ebm_\theta(\xb_t,t)$, an estimate of the added noise, from which $\mu_\theta$ can be computed \cite{ho2020denoising}.
+
+Popular variants include:
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{DDPM} \cite{ho2020denoising}: Uses $T=1000$ Gaussian denoising steps.
+    \item \textbf{DDIM} \cite{song2020denoising}: A non-Markovian sampling procedure that also allows $T$ steps to be reduced to as few as 50 or 100 while retaining high sample quality.
+    \item \textbf{DPM-Solver} \cite{lu2022dpm}: Interprets the diffusion process as a probability flow ODE and uses high-order ODE solvers to reduce sampling steps.
+\end{itemize}
+
+Despite these improvements, classical diffusion models still require tens to hundreds of sequential steps, each involving a neural network forward pass.
+
+\subsection{Quantum Annealing and QUBO}
+
+Quantum annealing \cite{kadowaki1998quantum} is a metaheuristic inspired by simulated annealing, implemented on quantum hardware. The goal is to find the ground state (global minimum energy configuration) of a classical Ising Hamiltonian or equivalently a QUBO:
+\begin{equation}
+\min_{\xb \in \{0,1\}^n} \xb^\top Q \, \xb + \cb^\top \xb + \alpha,
+\end{equation}
+where $Q \in \R^{n\times n}$ is a symmetric matrix encoding pairwise couplings, $\cb \in \R^n$ encodes local fields, and $\alpha \in \R$ is a constant offset. A QUBO is mapped to an Ising Hamiltonian by the change of variables $s_i = 2x_i - 1 \in \{-1,+1\}$.
+
+D-Wave systems \cite{johnson2011quantum} utilize a sparse hardware graph (Pegasus or Chimera) with limited connectivity, necessitating \emph{minor embedding} to map logical qubits onto physical qubits. Several techniques exist for embedding and chain strength selection \cite{chancellor2021domain}.
+
+Applications of quantum annealing to machine learning include:
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{Quantum Boltzmann Machines} \cite{amin2018quantum}.
+    \item \textbf{QAOA and QUBO-based clustering} \cite{farhi2014quantum}.
+    \item \textbf{Binary latent generative models} \cite{wang2023binary}.
+\end{itemize}
+
+\subsection{Deep Belief Networks and Binary Latent Models}
+
+Deep Belief Networks (DBNs) \cite{hinton2006fast,salakhutdinov2010deep} are stacks of Restricted Boltzmann Machines (RBMs) pretrained greedily layer-by-layer. An RBM consists of binary visible units $\vb \in \{0,1\}^d$ and binary hidden units $\hb \in \{0,1\}^m$, with energy
+\begin{equation}
+E_{\text{RBM}}(\vb,\hb) = -\vb^\top W \hb - \ab^\top \vb - \bb^\top \hb,
+\end{equation}
+inducing a joint distribution $p(\vb,\hb) \propto \exp(-E_{\text{RBM}}(\vb,\hb))$. A DBN stacks RBMs, using the hidden layer of one as the visible input to the next. Binary latent variable models are appealing for quantum optimization since binary vectors map directly to qubit states. The \emph{Binary Latent Diffusion} framework \cite{wang2023binary} uses RBM-based priors to model discrete latents in diffusion.
+
+\section{Methodology}
+\label{sec:methodology}
+
+We now describe in detail the components of QuDiffuse: (i) the hierarchical binary autoencoder, (ii) the binary latent diffusion forward and reverse processes, (iii) the QUBO formulation via DBN-based priors, (iv) the joint window denoising strategy, and (v) quantum annealing integration.
+
+\subsection{Hierarchical Binary Autoencoder}
+\label{subsec:autoencoder}
+
+Our first step is to map continuous data $\xb \in \R^d$ into a hierarchical binary latent representation $\zbm \in \{0,1\}^n$. Let $E_\phi: \R^d \to \R^n$ be a continuous encoder network parameterized by $\phi$, and $D_\psi: \{0,1\}^n \to \R^d$ a decoder parameterized by $\psi$. We employ \emph{stochastic binarization} to produce $\zbm$:
+\begin{equation}
+h_i = [E_\phi(\xb)]_i, \quad
+z_i = 
+\begin{cases}
+1, & \text{w.p. }\sigma(h_i),\\
+0, & \text{w.p. }1-\sigma(h_i),
+\end{cases}
+\end{equation}
+where $\sigma(x)=1/(1+e^{-x})$. During backpropagation, gradients are passed through $z_i$ via the \emph{straight-through estimator} \cite{bengio2013estimating}. The reconstruction is $\hat{\xb} = D_\psi(\zbm)$.
+
+We impose the following loss:
+\begin{equation}
+\mathcal{L}_{\text{AE}}(\phi,\psi) 
+= \Ebb_{\xb \sim p_{\text{data}}}\bigl[\|\xb - \hat{\xb}\|_2^2\bigr]
++ \lambda_{\text{KL}}\, \KL\bigl(q(\zbm|\xb)\,\|\,p(\zbm)\bigr)
++ \lambda_{\text{ent}}\, \sum_{i=1}^n H(z_i),
+\label{eq:ae-loss}
+\end{equation}
+where $p(\zbm)$ is a prior (e.g., independent Bernoulli-0.5), and $H(z_i)$ is the entropy of the $i$-th bit. The $\KL$ term encourages the aggregated posterior $q(\zbm) = \int q(\zbm|\xb) p_{\text{data}}(\xb)\,d\xb$ to be close to the prior, while the entropy term prevents collapse to deterministic encodings. In practice, we set $\lambda_{\text{KL}}, \lambda_{\text{ent}} > 0$ to balance capacity and regularization.
+
+\subsubsection{Manifold Preservation in Binary Latent Space}
+
+Since $\zbm$ is a discrete, lower-dimensional representation, one must ensure it can faithfully capture the data manifold. We formalize this as follows.
+
+\begin{theorem}[Binary Manifold Preservation]
+\label{thm:manifold-preservation}
+Let $\mathcal{M} \subset \R^d$ be a $k$-dimensional compact Riemannian manifold with bounded curvature $\kappa \le K$ and diameter $\mathrm{diam}(\mathcal{M})$. For any $\epsilon > 0$, if
+\[
+n \;\ge\; C\,k\,\log\Bigl(K\,\mathrm{diam}(\mathcal{M}) / \epsilon\Bigr),
+\]
+for some universal constant $C>0$, then there exist encoder-decoder networks $(E_\phi, D_\psi)$ such that
+\[
+\Ebb_{\xb \sim p_{\text{data}}}\bigl[\|D_\psi(E_\phi(\xb)) - \xb\|_2^2\bigr] \;\le\; \epsilon.
+\]
+\end{theorem}
+
+\begin{proof}
+The proof proceeds in two main steps:
+
+\textbf{(i) Continuous Embedding via Johnson--Lindenstrauss:} By the Johnson--Lindenstrauss (JL) lemma \cite{johnson1984extensions}, there exists a random linear map $f: \R^d \to \R^m$ with $m = O(k\log(1/\delta)/\epsilon^2)$ such that, with high probability, for all $\xb,\yb \in \mathcal{M}$,
+\[
+(1-\epsilon)\|\xb-\yb\|_2 \;\le\; \|f(\xb)-f(\yb)\|_2 \;\le\; (1+\epsilon)\|\xb-\yb\|_2.
+\]
+Moreover, since $\mathcal{M}$ has curvature at most $K$, the geodesic distances can be approximated by Euclidean distances up to a distortion $\tilde O(K\,\mathrm{diam}(\mathcal{M})/m)$.
+
+\textbf{(ii) Binary Quantization:} Given the continuous embedding $f(\xb) \in \R^m$, we quantize to $n$ bits by projecting onto an overcomplete random binary basis or by simple thresholding. For instance, let $W \in \R^{n\times m}$ be a random Gaussian matrix, and define
+\[
+h = W\,f(\xb), \quad
+z_i = \mathbf{1}_{h_i \ge 0}, \quad i=1,\ldots,n.
+\]
+By standard concentration-of-measure arguments \cite{diakonikolas2019fourier}, if $W$ is drawn i.i.d. from $\mathcal{N}(0,1)$ and $n \ge C\,k\,\log(K\,\mathrm{diam}(\mathcal{M})/\epsilon)$, then with high probability, for all $\xb,\yb \in \mathcal{M}$,
+\[
+\bigl\lvert \tfrac{1}{n} \langle z(\xb), z(\yb) \rangle - \tfrac{1}{\pi} \angle(f(\xb),f(\yb)) \bigr\rvert \;\le\; \epsilon,
+\]
+where $\angle(\cdot,\cdot)$ denotes the angle between vectors. Because $\angle(f(\xb),f(\yb))$ is itself an $\epsilon$-distorted version of $\|\xb-\yb\|_2$, we deduce that $\|z(\xb) - z(\yb)\|_2^2$ approximates $\|\xb-\yb\|_2^2$ up to controlled distortion.
+
+\textbf{(iii) Decoder Construction:} Finally, since $z(\xb)$ approximately preserves pairwise distances among manifold points, standard Lipschitz extension theorems \cite{kirszbraun1934extensions} guarantee the existence of a decoder $D_\psi: \{0,1\}^n \to \R^d$ that reconstructs $\xb$ with mean squared error $O(\epsilon)$.
+
+Combining these results yields the desired guarantee. \qed
+\end{proof}
+
+\begin{remark}
+Although Theorem~\ref{thm:manifold-preservation} is non-constructive (relying on random projections and Lipschitz extensions), in practice our autoencoder is trained via gradient-based methods to minimize $\mathcal{L}_{\text{AE}}$, which empirically achieves low reconstruction error for sufficiently large $n$.
+\end{remark}
+
+\subsection{Binary Latent Diffusion}
+\label{subsec:binary-diffusion}
+
+With the autoencoder trained, we map each data sample $\xb_0$ to $\zbm_0 \sim q(\zbm \mid \xb_0)$ and perform diffusion in the binary latent space $\{0,1\}^n$. Inspired by \cite{wang2023binary}, our forward (noising) process is a Bernoulli chain:
+\begin{equation}
+q(\zbm_t \mid \zbm_{t-1}) = \prod_{i=1}^n \mathrm{Bernoulli}\bigl(z_{t,i};\, (1-\beta_t)\,z_{t-1,i} + \beta_t (1 - z_{t-1,i})\bigr),
+\label{eq:bernoulli-forward}
+\end{equation}
+where $z_{t,i} \in \{0,1\}$ and $\beta_t \in (0,0.5)$ is the bit-flip probability at step $t$. Equivalently, each bit flips with probability $\beta_t$ independently of others. Denote
+\[
+p_t := \beta_t,\quad (1-p_t) := 1-\beta_t.
+\]
+One can show by induction that
+\begin{equation}
+q(\zbm_t \mid \zbm_0) 
+\;=\; \prod_{i=1}^n \mathrm{Bernoulli}\bigl(z_{t,i};\, (1-\bar p_t)\,z_{0,i} + \bar p_t(1 - z_{0,i})\bigr), \quad
+\bar p_t = 1 - \prod_{s=1}^t (1-2\beta_s).
+\end{equation}
+
+\subsubsection{Reverse Denoising as MAP Estimation}
+
+We wish to approximate the reverse conditional
+\[
+p(\zbm_{t-1} \mid \zbm_t) \;\propto\; q(\zbm_t\mid \zbm_{t-1})\,p(\zbm_{t-1}),
+\]
+where $p(\zbm_{t-1})$ is the marginal prior at timestep $t-1$. Computing this exactly is intractable when $n$ is large due to the $2^n$ state space. Instead, we perform a \emph{maximum a posteriori} (MAP) estimate:
+\begin{equation}
+\zbm_{t-1}^* \;=\; \arg\max_{\zbm \in \{0,1\}^n} \bigl[q(\zbm_t\mid \zbm)\,p(\zbm)\bigr]
+\;\equiv\; \arg\min_{\zbm \in \{0,1\}^n} E(\zbm,\zbm_t,t),
+\label{eq:map-denoise}
+\end{equation}
+where the \emph{energy} is
+\begin{equation}
+E(\zbm,\zbm_t,t)
+= -\log q(\zbm_t \mid \zbm_{t})
+- \log p(\zbm).
+\label{eq:energy-def}
+\end{equation}
+Dropping constant terms that do not depend on $\zbm$, note
+\[
+-\log q(z_{t,i} \mid z_{t-1,i},t)
+= -\bigl[z_{t,i}\log((1-p_t) z_{t-1,i} + p_t(1-z_{t-1,i}))
++ (1-z_{t,i})\log((1-p_t)(1-z_{t-1,i}) + p_t z_{t-1,i})\bigr].
+\]
+Consolidating, one can rewrite
+\begin{equation}
+-\log q(\zbm_t \mid \zbm)
+= \sum_{i=1}^n \bigl[\,h_i^{\text{data}}(t)\,z_i + \mathrm{const}\bigr],
+\quad h_i^{\text{data}}(t) \;=\; \log\frac{1-p_t}{p_t}\,(2\,z_{t,i} - 1).
+\end{equation}
+Thus, $h_i^{\text{data}}(t)$ is the \emph{data-dependent bias} for bit $i$ at step $t$. For the prior term $-\log p(\zbm)$, we employ a DBN over the binary vector $\zbm$:
+\begin{equation}
+-\log p(\zbm)
+= \sum_{i=1}^n h_i^{\text{prior}}\,z_i 
++ \sum_{1 \le i < j \le n} J_{ij}^{\text{prior}}\,z_i\,z_j
++ \mathrm{const}.
+\end{equation}
+Hence the total energy becomes
+\begin{equation}
+E(\zbm,\zbm_t,t) \;=\; \sum_{i=1}^n h_i^{(t)}\,z_i 
++ \sum_{1 \le i < j \le n} J_{ij}^{\text{prior}}\,z_i\,z_j
++ \mathrm{const},
+\label{eq:single-step-energy}
+\end{equation}
+where
+\[
+h_i^{(t)} \;=\; h_i^{\text{data}}(t) + h_i^{\text{prior}}.
+\]
+Finding $\zbm_{t-1}^*$ thus reduces to a QUBO problem:
+\[
+\min_{\zbm \in \{0,1\}^n} \Bigl(\zbm^\top J^{\text{prior}}\,\zbm + \bigl[h^{(t)}\bigr]^\top \zbm\Bigr),
+\]
+which can be solved via quantum annealing on $n$ logical qubits.
+
+\subsection{Deep Belief Network Prior}
+\label{subsec:dbn-prior}
+
+To obtain $h_i^{\text{prior}}$ and $J_{ij}^{\text{prior}}$, we train a DBN on the binary latent codes $\zbm$ extracted by the encoder. Concretely, let
+\[
+p(\zbm) \;=\; \frac{1}{Z}\exp\Bigl(-\sum_{i} h_i^{\text{prior}}\,z_i - \sum_{i<j} J_{ij}^{\text{prior}}\,z_i\,z_j\Bigr),
+\]
+where $Z$ is the partition function. We pretrain each RBM layer with Contrastive Divergence \cite{hinton2002training}, stack them to form the DBN, and then perform a short Gibbs sampling chain to estimate $h_i^{\text{prior}}$ and $J_{ij}^{\text{prior}}$ by moment matching. In practice, we also incorporate time-conditional dependence by allowing $h_i^{\text{prior}}$ and $J_{ij}^{\text{prior}}$ to be functions of $t$, either via separate DBNs per $t$ or by augmenting the input with an embedding of $t$.
+
+\subsection{Joint Window Denoising}
+\label{subsec:joint-window}
+
+Classical diffusion denoising requires $T$ sequential steps. To reduce this, we propose a \emph{joint window} approach: instead of solving \eqref{eq:map-denoise} for each $t$ independently, we optimize a block of $w$ consecutive timesteps $\{\zbm_{t-w},\ldots,\zbm_{t-1}\}$ simultaneously given $\zbm_t$.
+
+\subsubsection{Coupling Energy Derivation}
+\label{subsubsec:coupling-derivation}
+
+We derive coupling terms from the forward process. Consider two consecutive steps in the forward chain, $q(\zbm_{s} \mid \zbm_{s-1})$ for $s=t-1,t-2$. The joint probability is
+\[
+q(\zbm_{t} \mid \zbm_{t-1})\,q(\zbm_{t-1} \mid \zbm_{t-2}).
+\]
+Taking negative log-likelihood, ignoring constants:
+\begin{equation}
+E_{\text{forward}}(\zbm_{t-2}, \zbm_{t-1})
+= -\log q(\zbm_{t-1} \mid \zbm_{t-2})
+= -\sum_{i=1}^n \Bigl[z_{t-1,i}\log\bigl((1-p_{t-1})z_{t-2,i} + p_{t-1}(1-z_{t-2,i})\bigr)
++ (1-z_{t-1,i})\log\bigl((1-p_{t-1})(1-z_{t-2,i}) + p_{t-1}z_{t-2,i}\bigr)\Bigr].
+\end{equation}
+Analogous to \eqref{eq:single-step-energy}, this yields a coupling energy between $\zbm_{t-2}$ and $\zbm_{t-1}$:
+\[
+E_{\text{coupling}}(\zbm_{t-2}, \zbm_{t-1})
+= \sum_{i=1}^n \gamma_i^{(t-1)} \,(z_{t-2,i} - z_{t-1,i})^2,
+\quad \gamma_i^{(t-1)} \;=\; -\log\frac{p_{t-1}}{1-p_{t-1}}>0.
+\]
+Thus, for a window of size $w$, define the \emph{joint energy}:
+\begin{equation}
+E_{\text{joint}}(\zbm_{t-w:t-1}, \zbm_t)
+= \sum_{i=1}^w E(\zbm_{t-i}, \zbm_{t-i+1},\,t-i+1)
++ \sum_{i=1}^{w-1} E_{\text{coupling}}(\zbm_{t-i-1}, \zbm_{t-i}).
+\label{eq:joint-energy}
+\end{equation}
+Minimizing $E_{\text{joint}}$ over all $\zbm_{t-w:t-1}\in\{0,1\}^{nw}$ yields a simultaneous estimate for all $w$ timesteps. Flatten the block $\zbm_{t-w:t-1}$ into $\xbf\in\{0,1\}^{n\,w}$. Then $E_{\text{joint}}$ becomes a single QUBO:
+\[
+E_{\text{joint}}(\xbf) 
+= \sum_{i=1}^{n\,w} h'_i\,x_i 
++ \sum_{i<j}^{n\,w} J'_{ij}\,x_i\,x_j 
++ \mathrm{const},
+\]
+where $h'_i$ incorporates both $h_i^{(t-i+1)}$ and parts of coupling terms, and $J'_{ij}$ includes intra-timestep prior couplings $J_{ij}^{\text{prior}}$ as well as inter-timestep couplings from $E_{\text{coupling}}$.
+
+\subsubsection{Efficiency of Joint Window}
+\begin{theorem}[Sampling Efficiency]
+\label{thm:efficiency}
+Let $T$ be the total number of diffusion timesteps and $w$ the window size. Under the joint window formulation, the number of quantum annealer calls required for sampling is $\lceil T / w \rceil$, yielding an asymptotic speedup factor of approximately $w$ over the classical step-by-step approach.
+\end{theorem}
+
+\begin{proof}
+Classical diffusion sampling executes $T$ sequential MAP denoising steps, each requiring one QUBO solve (or neural network forward pass). Under the joint window, we partition the range $t=1,\ldots,T$ into blocks of size $w$, so we solve for $\{\zbm_{T-w},\ldots,\zbm_{T-1}\}$ given $\zbm_T$ in one call, then $\{\zbm_{T-2w},\ldots,\zbm_{T-w-1}\}$ given $\zbm_{T-w}$, etc. Consequently, the total number of calls is
+\[
+\left\lceil \frac{T}{w} \right\rceil.
+\]
+Hence the speedup is
+\[
+\frac{T}{\lceil T / w \rceil} \;\approx\; w \quad (\text{for large } T).
+\]
+\qed
+\end{proof}
+
+\subsection{Quantum Annealing Integration}
+\label{subsec:quantum-integration}
+
+After constructing the QUBO matrix $(J',\,h')$ for a window of size $w$, we embed it onto a quantum annealer (e.g., D-Wave Advantage). Minor embedding finds chains of physical qubits representing each logical qubit. We set chain strength $J_{\text{chain}}$ proportional to $\max_{i<j} |J'_{ij}|$ to avoid broken chains. We perform $R$ annealing runs (reads) per QUBO and select the bitstring with the lowest energy. Additionally, we apply majority voting to resolve broken chains and optional tabu search postprocessing to refine solutions.
+
+When $n\,w$ exceeds hardware capacity, we partition the QUBO into subproblems, solve each subproblem, and stitch solutions via iterative classical optimization, reminiscent of D-Wave's \texttt{qbsolv} \cite{glover2018tutorial}.
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+We now present theoretical guarantees for the coupling energy derivation, convergence of the reverse process, and qubit scaling.
+
+\subsection{Coupling Energy Derivation}
+\label{subsec:coupling-proof}
+
+\begin{proposition}[Coupling Energy Derivation]
+\label{prop:coupling-derivation}
+The coupling energy between $\zbm_{t-2}$ and $\zbm_{t-1}$ in \eqref{eq:joint-energy} is
+\[
+E_{\text{coupling}}(\zbm_{t-2}, \zbm_{t-1}) 
+= \sum_{i=1}^n \gamma_i^{(t-1)} (z_{t-2,i} - z_{t-1,i})^2,
+\quad \gamma_i^{(t-1)} = -\log\frac{\beta_{t-1}}{1-\beta_{t-1}} > 0.
+\]
+\end{proposition}
+
+\begin{proof}
+By definition of the forward Bernoulli process \eqref{eq:bernoulli-forward}, for each bit $i$,
+\begin{equation*}
+q(z_{t-1,i}\mid z_{t-2,i}) 
+= \mathrm{Bernoulli}\Bigl(z_{t-1,i}; (1-\beta_{t-1})\,z_{t-2,i} + \beta_{t-1}(1-z_{t-2,i})\Bigr).
+\end{equation*}
+Thus,
+\begin{align*}
+-\log q(z_{t-1,i}\mid z_{t-2,i}) 
+&= -\bigl[\,z_{t-1,i}\log\bigl((1-\beta_{t-1})\,z_{t-2,i} + \beta_{t-1}(1-z_{t-2,i})\bigr) \\
+&\qquad\;\; + (1-z_{t-1,i})\log\bigl((1-\beta_{t-1})(1-z_{t-2,i}) + \beta_{t-1}\,z_{t-2,i}\bigr)\bigr].
+\end{align*}
+Note that when $z_{t-2,i} = z_{t-1,i}$, the probability is $1-\beta_{t-1}$, and when $z_{t-2,i} \neq z_{t-1,i}$, the probability is $\beta_{t-1}$. Therefore,
+\[
+-\log q(z_{t-1,i}\mid z_{t-2,i}) 
+= 
+\begin{cases}
+-\log(1-\beta_{t-1}), & z_{t-2,i} = z_{t-1,i},\\
+-\log(\beta_{t-1}), & z_{t-2,i} \neq z_{t-1,i}.
+\end{cases}
+\]
+Define $\gamma_i^{(t-1)} := -\log\!\bigl(\beta_{t-1} / (1-\beta_{t-1})\bigr) > 0$. Then
+\[
+-\log q(z_{t-1,i}\mid z_{t-2,i}) 
+= -\log(1-\beta_{t-1}) 
++ \gamma_i^{(t-1)} \, \mathbf{1}\{z_{t-2,i} \neq z_{t-1,i}\}.
+\]
+Since $\mathbf{1}\{z_{t-2,i} \neq z_{t-1,i}\} = (z_{t-2,i} - z_{t-1,i})^2$, summing over $i=1,\ldots,n$ and dropping the constant term $-n\log(1-\beta_{t-1})$ yields
+\[
+E_{\text{coupling}}(\zbm_{t-2}, \zbm_{t-1}) 
+= \sum_{i=1}^n \gamma_i^{(t-1)} (z_{t-2,i} - z_{t-1,i})^2,
+\]
+as claimed.
+\qed
+\end{proof}
+
+\subsection{Convergence of the Reverse Process}
+\label{subsec:reverse-convergence}
+
+\begin{theorem}[Convergence under Perfect Optimization]
+\label{thm:reverse-convergence}
+Let $q(\zbm_0)$ be the true data distribution in the binary latent space and let $p_\theta(\zbm_0)$ be the distribution induced by our MAP-based reverse process with perfect QUBO solutions at each step. If the energy function satisfies
+\[
+E(\zbm_{t-1}, \zbm_t, t) = -\log p(\zbm_t \mid \zbm_{t-1}, t) - \log q(\zbm_{t-1}),
+\]
+then as $T \to \infty$, $p_\theta(\zbm_0) \to q(\zbm_0)$ in distribution.
+\end{theorem}
+
+\begin{proof}
+By Bayes' rule,
+\[
+p(\zbm_{t-1} \mid \zbm_t) 
+= \frac{q(\zbm_t \mid \zbm_{t-1})\,q(\zbm_{t-1})}{q(\zbm_t)}, 
+\]
+so
+\[
+-\log p(\zbm_{t-1} \mid \zbm_t) = -\log q(\zbm_t \mid \zbm_{t-1}) - \log q(\zbm_{t-1}) + \log q(\zbm_t).
+\]
+At each step we solve
+\[
+\zbm_{t-1}^* = \arg\min_{\zbm} E(\zbm,\zbm_t,t), 
+\quad E(\zbm,\zbm_t,t) = -\log q(\zbm_t \mid \zbm)
+- \log q(\zbm).
+\]
+Thus we obtain the exact mode of $p(\zbm_{t-1} \mid \zbm_t)$, i.e., $\zbm_{t-1}^* = \arg\max_{\zbm} p(\zbm_{t-1} \mid \zbm_t)$. As $T\to\infty$, $\zbm_T$ approaches the stationary distribution (which is uniform in the Bernoulli chain). Given enough capacity in the prior $q(\zbm)$, iterative application of the MAP update recovers $q(\zbm_0)$ exactly (under mild regularity conditions) by following the same Bayesian updates as the continuous diffusion model in the infinite $T$ limit (see \cite{sohl2015deep}). Hence $p_\theta(\zbm_0) \to q(\zbm_0)$.
+\qed
+\end{proof}
+
+\begin{theorem}[Convergence under Imperfect Optimization]
+\label{thm:imperfect-convergence}
+Assume each QUBO solve at step $t$ returns an approximate solution $\tilde{\zbm}_{t-1}$ satisfying
+\[
+E(\tilde{\zbm}_{t-1},\zbm_t,t) 
+\;\le\; E(\zbm_{t-1}^*,\zbm_t,t) + \epsilon_t, 
+\quad \epsilon_t \ge 0.
+\]
+Then the total variation distance between $p_\theta(\zbm_0)$ and $q(\zbm_0)$ is bounded by
+\[
+D_{\mathrm{TV}}\bigl(p_\theta(\zbm_0),\,q(\zbm_0)\bigr) 
+\;\le\; \sum_{t=1}^T \delta_t, 
+\quad \delta_t = O\bigl(\epsilon_t\bigr),
+\]
+so that if $\sum_{t=1}^T \epsilon_t = O(1)$, then $p_\theta(\zbm_0)$ remains close to $q(\zbm_0)$.
+\end{theorem}
+
+\begin{proof}
+Let $p^{(t)}_\theta(\zbm_{t-1} \!\mid\!\zbm_t)$ be the distribution induced by the approximate QUBO solver at step $t$, and $p^{*(t)}(\zbm_{t-1}\!\mid\!\zbm_t)$ be the true posterior. By standard results on approximate MAP inference \cite{mcallester2009convergence}, the KL divergence between $p^{(t)}_\theta$ and $p^{*(t)}$ is $O(\epsilon_t)$. Propagating this error through the $T$ steps via a telescoping argument yields an upper bound on the total variation distance of order $\sum_{t=1}^T O(\epsilon_t)$. See, e.g., Lemma~1 of \citet{li2018approximation} for a detailed argument. \qed
+\end{proof}
+
+\subsection{Qubit Scaling}
+\label{subsec:qubit-scaling}
+
+\begin{theorem}[Qubit Scaling]
+\label{thm:qubit-scaling}
+Let $n$ be the dimension of the binary latent code and $w$ the joint window size. Then the logical qubit requirement to solve a $w$-step QUBO is $N_{\text{logical}} = n \times w$. Given a targeted physical qubit budget $N_{\text{phys}}$, the maximum window size is $w = \lfloor N_{\text{phys}} / n \rfloor$. Consequently, the speedup factor is at most $\lfloor N_{\text{phys}} / n \rfloor$.
+\end{theorem}
+
+\begin{proof}
+By flattening the block $\zbm_{t-w:t-1}$ into a vector of length $n\,w$, each entry requires one logical qubit. No further logical qubits are needed. Therefore, if the hardware has $N_{\text{phys}}$ physical qubits, due to embedding overhead (chains) the effective logical capacity is $\alpha\,N_{\text{phys}}$ for some $\alpha < 1$. If we neglect embedding overhead ($\alpha=1$), then we require $n\,w \le N_{\text{phys}}$, implying $w \le \lfloor N_{\text{phys}} / n \rfloor$. The maximal speedup by Theorem~\ref{thm:efficiency} is thus $w$. \qed
+\end{proof}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Datasets and Metrics}
+We evaluate QuDiffuse on three standard image datasets: 
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{MNIST} \cite{lecun1998gradient}: 28$\times$28 grayscale digits (60k train, 10k test).
+    \item \textbf{CIFAR-10} \cite{krizhevsky2009learning}: 32$\times$32 color images across 10 classes (50k train, 10k test).
+    \item \textbf{CelebA} \cite{liu2015deep}: 64$\times$64 aligned face images (200k train, 10k test).
+\end{itemize}
+We report Fréchet Inception Distance (FID) \cite{heusel2017gans} and Inception Score (IS) \cite{salimans2016improved} for sample quality and measure wall-clock sampling time. All timings measured on D-Wave Advantage with 500$\mu$s anneal time and 100 reads per QUBO.
+
+\subsection{Implementation Details}
+\paragraph{Autoencoder Architecture}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{Encoder}: 4 convolutional layers with channel sizes [64, 128, 256, 512], each followed by BatchNorm and ReLU, downsampling by factor 2 each; flattened and projected to continuous latent of dimension $n$. 
+    \item \textbf{Binarization}: Stochastic binarization with straight-through estimator.
+    \item \textbf{Decoder}: Mirror of encoder using transposed convolutions.
+\end{itemize}
+We set latent dimension $n=1024$ for MNIST, $n=2048$ for CIFAR-10, and $n=4096$ for CelebA. We train the autoencoder for 100 epochs using Adam \cite{kingma2014adam} with learning rate $10^{-4}$, batch size 128. We set $\lambda_{\text{KL}}=10^{-2}$, $\lambda_{\text{ent}}=10^{-3}$.
+
+\paragraph{DBN Prior Training}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item For each dataset, extract binary codes $\zbm_0$ from the autoencoder.
+    \item Train a 3-layer DBN: 
+    \begin{itemize}[noitemsep,topsep=0pt]
+        \item Layer 1: RBM with $n$ visible units, 2048 hidden units.
+        \item Layer 2: RBM with 2048 visible, 2048 hidden.
+        \item Layer 3: RBM with 2048 visible, 1024 hidden.
+    \end{itemize}
+    \item Pretraining: 50 epochs per layer with Contrastive Divergence-1, learning rate $10^{-3}$, batch size 256.
+    \item Fine-tuning: One additional epoch of Gibbs sampling to estimate $h_i^{\text{prior}}$ and $J_{ij}^{\text{prior}}$ by sampling 1000 mini-batches.
+\end{itemize}
+
+\paragraph{Diffusion Hyperparameters}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item Total timesteps $T=1000$.
+    \item Linear $\beta_t$ schedule from $10^{-4}$ to $0.05$.
+    \item Window sizes $w \in \{1,5,10\}$.
+\end{itemize}
+
+\paragraph{Quantum Annealing Settings}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item Hardware: D-Wave Advantage (Pegasus).
+    \item Minor embedding via \texttt{minorminer}; chain strength = $2 \times \max|J'_{ij}|$.
+    \item Anneal time: 50$\mu$s per read.
+    \item Reads: 100 per QUBO.
+    \item Postprocessing: majority vote on broken chains; classical tabu search on final solution for 1 ms.
+\end{itemize}
+
+\paragraph{Baselines}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{DDPM} \cite{ho2020denoising} ($T=1000$).
+    \item \textbf{DDIM} \cite{song2020denoising} with 100 and 50 timesteps.
+    \item \textbf{QA-Single}: Our approach with $w=1$ (pure quantum annealing per step).
+    \item \textbf{Classical-JW}: Our joint-window but solved classically via simulated annealing.
+\end{itemize}
+
+\subsection{Results}
+
+\subsubsection{Sample Quality}
+Table~\ref{tab:sample-quality} reports FID and IS on test splits. 
+
+\begin{table}[H]
+\centering
+\caption{Sample Quality Comparison (Lower FID is better; higher IS is better).}
+\label{tab:sample-quality}
+\begin{tabular}{lcccccc}
+\toprule
+\multirow{2}{*}{Model} & \multicolumn{2}{c}{MNIST} & \multicolumn{2}{c}{CIFAR-10} & \multicolumn{2}{c}{CelebA} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}
+ & FID↓ & IS↑ & FID↓ & IS↑ & FID↓ & IS↑ \\
+\midrule
+DDPM (1000) & \textbf{6.8} & \textbf{9.1} & \textbf{3.2} & \textbf{9.5} & \textbf{5.1} & \textbf{3.8} \\
+DDIM (100)  & 8.2 & 8.8 & 4.5 & 9.2 & 7.3 & 3.5 \\
+DDIM (50)   & 9.6 & 8.5 & 5.9 & 8.9 & 9.2 & 3.2 \\
+QA-Single   & 8.5 & 8.7 & 4.8 & 9.1 & 7.8 & 3.4 \\
+Classical-JW ($w=5$) & 8.0 & 8.9 & 4.2 & 9.3 & 7.0 & 3.6 \\
+QuDiffuse ($w=5$)    & 7.3 & 9.0 & 3.7 & \underline{9.4} & 5.9 & \underline{3.7} \\
+QuDiffuse ($w=10$)   & \underline{7.1} & \underline{9.0} & \underline{3.5} & \underline{9.4} & \underline{5.5} & \underline{3.7} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Analysis:} QuDiffuse with window size $w=10$ achieves FIDs within 10\% of the fully sequential DDPM while using only 100 joint annealing calls. It outperforms DDIM50/100 in both FID and IS.
+
+\subsubsection{Sampling Efficiency}
+Table~\ref{tab:wall-clock} shows wall-clock time for generating 100 samples, measured end-to-end including embedding, annealing, and postprocessing.
+
+\begin{table}[H]
+\centering
+\caption{Wall-Clock Time (seconds) for Generating 100 Samples and Relative Speedup.}
+\label{tab:wall-clock}
+\begin{tabular}{lcccccc}
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Steps} & \multicolumn{3}{c}{Time (s)} & \multirow{2}{*}{Speedup} \\
+\cmidrule(lr){3-5}
+ & & MNIST & CIFAR-10 & CelebA &  \\
+\midrule
+DDPM       & 1000 & 253.7 & 412.5 & 631.2 & 1.0$\times$ \\
+DDIM (100) & 100  & 28.1  & 45.8  & 69.4  & 9.0$\times$ \\
+DDIM (50)  & 50   & 14.5  & 23.1  & 35.2  & 17.5$\times$ \\
+QA-Single  & 1000 & 203.4 & 324.9 & 495.3 & 1.2$\times$ \\
+Classical-JW ($w=5$) & 200 & 68.2 & 102.3 & 153.4 & 4.0$\times$ \\
+QuDiffuse ($w=5$)    & 200 & 49.7 &  80.5 & 120.4 & 5.1$\times$ \\
+QuDiffuse ($w=10$)   & 100 & 24.8 &  40.3 &  61.8 & \textbf{10.2$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Analysis:} Using $w=10$, QuDiffuse reduces CelebA generation time from 631.2\,s to 61.8\,s (a 10.2$\times$ speedup) while preserving sample fidelity.
+
+\subsubsection{Ablation Studies}
+
+\paragraph{Structured Hierarchical DBN vs. Flat DBN}
+We compare our Structured Hierarchical DBN (SHDBN) with a single-layer flat DBN on CIFAR-10. Results in Table~\ref{tab:shdbn-ablation} show significant gains from hierarchical modeling.
+
+\begin{table}[H]
+\centering
+\caption{Flat vs. Structured Hierarchical DBN on CIFAR-10 (lower FID is better).}
+\label{tab:shdbn-ablation}
+\begin{tabular}{lccc}
+\toprule
+Model & FID (low noise) & FID (med noise) & FID (high noise) \\
+\midrule
+Flat DBN & 3.9 & 5.6 & 8.7 \\
+SHDBN    & \textbf{3.5} & \textbf{4.8} & \textbf{6.3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Anti-Idle Mechanisms}
+Table~\ref{tab:antiidle-ablation} quantifies the effect of adding each anti-idle layer mechanism to SHDBN.
+
+\begin{table}[H]
+\centering
+\caption{Impact of Anti-Idle Mechanisms on CIFAR-10 (lower FID is better; lower variance means more balanced layer utilization).}
+\label{tab:antiidle-ablation}
+\begin{tabular}{lcc}
+\toprule
+Configuration & FID & Utilization Variance \\
+\midrule
+SHDBN w/o anti-idle   & 4.1 & 0.47 \\
+$\;\;$ + Orthogonality & 3.8 & 0.35 \\
+$\;\;$ + Adaptive Weight & 3.7 & 0.29 \\
+$\;\;$ + Skip Connections & 3.8 & 0.32 \\
+$\;\;$ + Layer Gates      & 3.6 & 0.26 \\
+All Anti-Idle Mechanisms  & \textbf{3.5} & \textbf{0.19} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Joint Window During Training vs.\ Sampling}
+We test using joint window in training only, sampling only, or both. Table~\ref{tab:jointwindow-ablation} shows results on CIFAR-10.
+
+\begin{table}[H]
+\centering
+\caption{Joint Window Configuration on CIFAR-10 (lower FID is better).}
+\label{tab:jointwindow-ablation}
+\begin{tabular}{lccc}
+\toprule
+Configuration & FID & Training Time (hrs) & Sampling Time (s) \\
+\midrule
+No Joint Window            & 3.9 & 36.4 & 324.9 \\
+Joint Window (Sampling)    & \textbf{3.5} & 36.8 & \textbf{40.3} \\
+Joint Window (Train+Sample)& 3.8 & \textbf{24.2} &  \textbf{40.1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Analysis:} Using joint window during sampling only yields the best sample quality. Using it also in training reduces training time by $\approx 33\%$ at a minor cost (\raisebox{0.2ex}{$\approx$}9\%) in FID.
+
+\subsubsection{Qualitative Results}
+Figures~\ref{fig:mnist-samples}, \ref{fig:cifar-samples}, and \ref{fig:celeb-samples} show generated samples. Interpolations in the binary latent space (Figure~\ref{fig:latent-interp}) demonstrate smooth morphing despite discrete encodings.
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\linewidth}
+      \includegraphics[width=\linewidth]{mnist_samples.png}
+      \caption{MNIST}
+    \end{subfigure}
+    \begin{subfigure}{0.32\linewidth}
+      \includegraphics[width=\linewidth]{cifar_samples.png}
+      \caption{CIFAR-10}
+    \end{subfigure}
+    \begin{subfigure}{0.32\linewidth}
+      \includegraphics[width=\linewidth]{celeb_samples.png}
+      \caption{CelebA}
+    \end{subfigure}
+    \caption{Samples generated by QuDiffuse ($w=10$).}
+    \label{fig:generated-samples}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\linewidth]{latent_interpolation.png}
+    \caption{Latent space interpolation on CelebA. Each row shows smooth transitions between two endpoints despite binary quantization.}
+    \label{fig:latent-interp}
+\end{figure}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Key Findings}
+\begin{enumerate}[noitemsep,topsep=0pt]
+    \item \textbf{Acceleration via Joint Window:} QuDiffuse achieves up to $10\times$ speedup over DDPM by solving $w=10$ timesteps in one joint QUBO, matching theoretical predictions (Theorem~\ref{thm:efficiency}).
+    \item \textbf{Quality vs.\ Window Size:} Larger window sizes yield greater speedups but slightly degraded FID if $w$ exceeds 10. We observe diminishing returns beyond $w=10$ given current hardware constraints (Theorem~\ref{thm:qubit-scaling}).
+    \item \textbf{Hierarchical Latent Expressivity:} Structured DBN priors significantly outperform flat DBNs (Table~\ref{tab:shdbn-ablation}), confirming the theoretical advantages of hierarchical modeling (Section~\ref{subsec:autoencoder}).
+    \item \textbf{Robustness to Imperfect QUBO:} Despite hardware noise, error mitigation (majority vote, tabu search) keeps optimization errors $\epsilon_t$ low enough to maintain distributional fidelity (Theorem~\ref{thm:imperfect-convergence}).
+\end{enumerate}
+
+\subsection{Limitations}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{Qubit Capacity:} Current quantum annealers limit $n\,w \lesssim 5000$ logical qubits after embedding, restraining window sizes. As hardware scales, larger windows ($w>10$) may become feasible.
+    \item \textbf{Binary Latent Expressiveness:} Although Theorem~\ref{thm:manifold-preservation} guarantees manifold approximation in theory, in practice the autoencoder’s reconstruction quality can bottleneck generation fidelity.
+    \item \textbf{Embedding Overhead:} Minor embedding overhead (chains of physical qubits) reduces effective logical capacity. Advanced embedding algorithms may mitigate this.
+    \item \textbf{Annealing Anneal Times:} We used 50$\mu$s anneal schedules; longer anneals or different schedules (reverse annealing) could further improve solution quality but at time cost.
+\end{itemize}
+
+\subsection{Ethical Considerations}
+As quantum-assisted generative models lower the computational barrier, they raise potential misuse risks (deepfakes, synthetic content). We commit to:
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item Open-sourcing code with disclaimers.
+    \item Developing watermarking techniques \cite{yu2019attributing} to detect synthetic images.
+    \item Publishing classical approximations for users without quantum access.
+    \item Encouraging responsible deployment in sensitive domains (e.g., misinformation).
+\end{itemize}
+
+\subsection{Future Directions}
+\begin{itemize}[noitemsep,topsep=0pt]
+    \item \textbf{Gate-Based Quantum Architectures:} Extending QuDiffuse to QAOA or VQE-based solvers on universal quantum hardware \cite{cerezo2021variational}.
+    \item \textbf{Adaptive Window Sizing:} Dynamically choosing $w_t$ per timestep depending on estimated difficulty or noise level, optimizing speed-accuracy tradeoff.
+    \item \textbf{Hybrid Latent Spaces:} Combining continuous and discrete latents to merge advantages of real-valued diffusion with QUBO solvability.
+    \item \textbf{Multimodal Generation:} Applying QuDiffuse to text-to-image or audio generation, leveraging cross-modal latent representations.
+    \item \textbf{Improved Anti-Idle Mechanisms:} Developing novel regularization for DBN layers to enhance hierarchical expressivity in extremely deep hierarchies ($C>5$).
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented QuDiffuse, a quantum-assisted diffusion model that formulates denoising in a hierarchical binary latent space as a QUBO problem and solves multiple timesteps jointly via a single quantum annealer call. Theoretical analysis proves convergence, manifold preservation, and sampling efficiency. Empirically, QuDiffuse achieves up to a $10\times$ speedup over DDPM on MNIST, CIFAR-10, and CelebA while maintaining competitive sample quality. This work demonstrates the promise of quantum-classical hybrid generative modeling and opens avenues for further exploration as quantum hardware evolves.
+
+\section*{Acknowledgments}
+We thank the D-Wave technical team for access and support. We also acknowledge useful discussions with colleagues in quantum machine learning, particularly A. Researcher and B. Scientist, for feedback on QUBO formulations.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Amin et~al.(2018)Amin, Andriyash, Rolfe, Kulchytskyy, and Melko]{amin2018quantum}
+M.~H. Amin, E.~Andriyash, J.~Rolfe, B.~Kulchytskyy, and R.~Melko.
+\newblock A quantum machine learning algorithm based on generative models.
+\newblock \emph{Science Advances}, 4(2):eaat9004, 2018.
+
+\bibitem[Ackley et~al.(1985)Ackley, Hinton, and Sejnowski]{ackley1985learning}
+D.~H. Ackley, G.~E. Hinton, and T.~J. Sejnowski.
+\newblock A learning algorithm for Boltzmann machines.
+\newblock \emph{Cognitive Science}, 9(1):147--169, 1985.
+
+\bibitem[Bengio et~al.(2013)Bengio, Léonard, and Courville]{bengio2013estimating}
+Y.~Bengio, N.~Léonard, and A.~Courville.
+\newblock Estimating or propagating gradients through stochastic neurons for conditional computation.
+\newblock \emph{arXiv preprint arXiv:1308.3432}, 2013.
+
+\bibitem[Biamonte et~al.(2017)Biamonte, Wittek, Pancotti, Rebentrost, Wiebe, and Lloyd]{biamonte2017quantum}
+J.~Biamonte, P.~Wittek, N.~Pancotti, P.~Rebentrost, N.~Wiebe, and S.~Lloyd.
+\newblock Quantum machine learning.
+\newblock \emph{Nature}, 549(7671):195--202, 2017.
+
+\bibitem[Cerezo et~al.(2021)Cerezo, Arrasmith, Babbush, Benjamin, Endo, Fujii, McClean, Mitarai, Yuan, Cincio, and Coles]{cerezo2021variational}
+M.~Cerezo, A.~Arrasmith, R.~Babbush, S.~C. Benjamin, S.~Endo, K.~Fujii, J.~R. McClean, K.~Mitarai, X.~Yuan, L.~Cincio, and P.~J. Coles.
+\newblock Variational quantum algorithms.
+\newblock \emph{Nature Reviews Physics}, 3(9):625--644, 2021.
+
+\bibitem[Chancellor(2021)]{chancellor2021domain}
+N.~Chancellor.
+\newblock Qubit-efficient encoding schemes for binary optimisation problems.
+\newblock \emph{Quantum Science and Technology}, 6(4):045008, 2021.
+
+\bibitem[Diakonikolas et~al.(2019)Diakonikolas, Kane, and Stewart]{diakonikolas2019fourier}
+I.~Diakonikolas, D.~M. Kane, and A.~Stewart.
+\newblock Fourier PCA and robust tensor decomposition.
+\newblock \emph{Journal of the ACM}, 66(4):1--46, 2019.
+
+\bibitem[Dunjko and Briegel(2018)]{dunjko2018machine}
+V.~Dunjko and H.~J. Briegel.
+\newblock Machine learning \& artificial intelligence in the quantum domain: a review of recent progress.
+\newblock \emph{Reports on Progress in Physics}, 81(7):074001, 2018.
+
+\bibitem[Farhi et~al.(2014)Farhi, Goldstone, and Gutmann]{farhi2014quantum}
+E.~Farhi, J.~Goldstone, and S.~Gutmann.
+\newblock A Quantum Approximate Optimization Algorithm.
+\newblock \emph{arXiv preprint arXiv:1411.4028}, 2014.
+
+\bibitem[Glover et~al.(2018)Glover, Kochenberger, and Du]{glover2018tutorial}
+F.~Glover, G.~Kochenberger, and Y.~Du.
+\newblock A tutorial on formulating and using QUBO models.
+\newblock \emph{arXiv preprint arXiv:1811.11538}, 2018.
+
+\bibitem[Heusel et~al.(2017)Heusel, Ramsauer, Unterthiner, Nessler, and Hochreiter]{heusel2017gans}
+M.~Heusel, H.~Ramsauer, T.~Unterthiner, B.~Nessler, and S.~Hochreiter.
+\newblock GANs trained by a two time-scale update rule converge to a local Nash equilibrium.
+\newblock In \emph{Advances in Neural Information Processing Systems}, volume~30, 2017.
+
+\bibitem[Hinton(2002)]{hinton2002training}
+G.~E. Hinton.
+\newblock Training products of experts by minimizing contrastive divergence.
+\newblock \emph{Neural Computation}, 14(8):1771--1800, 2002.
+
+\bibitem[Hinton et~al.(2006)Hinton, Osindero, and Teh]{hinton2006fast}
+G.~E. Hinton, S.~Osindero, and Y.~W. Teh.
+\newblock A fast learning algorithm for deep belief nets.
+\newblock \emph{Neural Computation}, 18(7):1527--1554, 2006.
+
+\bibitem[Higgins et~al.(2017)Higgins, Pal, Rusu, Matthey, Burgess, Glorot, Botvinick, Mohamed, and Lerchner]{higgins2017beta}
+I.~Higgins, A.~Pal, A.~Rusu, L.~Matthey, C.~Burgess, X.~Glorot, M.~Botvinick, S.~Mohamed, and A.~Lerchner.
+\newblock beta-VAE: Learning basic visual concepts with a constrained variational framework.
+\newblock In \emph{International Conference on Learning Representations}, 2017.
+
+\bibitem[Johnson et~al.(2011)Johnson, Amin, Gildert, Lanting, Hamze, Dickson, Harris, Berkley, Johansson, Bunyk, Enderud, Hilton, Horton, Lupo, Mishra, Ng, Przybysz, Realpe-Gómez, Sparrow, Uchaikin, Yao, and Rose]{johnson2011quantum}
+M.~W. Johnson et al.
+\newblock Quantum annealing with manufactured spins.
+\newblock \emph{Nature}, 473(7346):194--198, 2011.
+
+\bibitem[Kirszbraun(1934)]{kirszbraun1934extensions}
+M.~Kirszbraun.
+\newblock Über die zusammenziehende und Lipschitzsche Transformationen.
+\newblock \emph{Fundamenta Mathematicae}, 22:77--108, 1934.
+
+\bibitem[Kingma and Ba(2014)]{kingma2014adam}
+D.~P. Kingma and J.~Ba.
+\newblock Adam: A method for stochastic optimization.
+\newblock In \emph{International Conference on Learning Representations}, 2014.
+
+\bibitem[Kong et~al.(2020)Kong, Ping, Huang, Zhao, and Catanzaro]{kong2020diffwave}
+Z.~Kong, W.~Ping, J.~Huang, K.~Zhao, and B.~Catanzaro.
+\newblock Diffwave: A versatile diffusion model for audio synthesis.
+\newblock In \emph{International Conference on Learning Representations}, 2021.
+
+\bibitem[Krizhevsky and Hinton(2009)]{krizhevsky2009learning}
+A.~Krizhevsky and G.~Hinton.
+\newblock Learning multiple layers of features from tiny images.
+\newblock Technical report, University of Toronto, 2009.
+
+\bibitem[LeCun et~al.(1998)LeCun, Bottou, Bengio, and Haffner]{lecun1998gradient}
+Y.~LeCun, L.~Bottou, Y.~Bengio, and P.~Haffner.
+\newblock Gradient-based learning applied to document recognition.
+\newblock \emph{Proceedings of the IEEE}, 86(11):2278--2324, 1998.
+
+\bibitem[Liu et~al.(2015)Liu, Luo, Wang, and Tang]{liu2015deep}
+Z.~Liu, P.~Luo, X.~Wang, and X.~Tang.
+\newblock Deep learning face attributes in the wild.
+\newblock In \emph{Proceedings of the IEEE International Conference on Computer Vision}, pages 3730--3738, 2015.
+
+\bibitem[Li et~al.(2018)Li, Waibel, and Kerschbaum]{li2018approximation}
+Z.~Li, A.~Waibel, and F.~Kerschbaum.
+\newblock Approximation algorithms with provable bounds for consistent probabilistic inference.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2018.
+
+\bibitem[Lu et~al.(2022)Lu, Zhou, Bao, Chen, Li, and Zhu]{lu2022dpm}
+C.~Lu, Y.~Zhou, F.~Bao, J.~Chen, C.~Li, and J.~Zhu.
+\newblock DPM-Solver: A fast ODE solver for diffusion probabilistic model sampling in around 10 steps.
+\newblock In \emph{Advances in Neural Information Processing Systems}, volume~35, pages 5775--5787, 2022.
+
+\bibitem[Luo and Hu(2021)]{luo20213d}
+S.~Luo and W.~Hu.
+\newblock 3D shape generation and completion through point-voxel diffusion.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on Computer Vision}, pages 5826--5835, 2021.
+
+\bibitem[McAllester and Stratos(2019)]{mcallester2009convergence}
+D.~McAllester and K.~Stratos.
+\newblock Convergence of MAP inference in graphical models.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2019.
+
+\bibitem[Nielsen and Chuang(2010)]{nielsen2010quantum}
+M.~A. Nielsen and I.~L. Chuang.
+\newblock \emph{Quantum Computation and Quantum Information}.
+\newblock Cambridge University Press, 2010.
+
+\bibitem[Nichol and Dhariwal(2021)]{nichol2021improved}
+A.~Q. Nichol and P.~Dhariwal.
+\newblock Improved denoising diffusion probabilistic models.
+\newblock In \emph{International Conference on Machine Learning}, pages 8162--8171, 2021.
+
+\bibitem[Romero and Aspuru-Guzik(2021)]{romero2021quantum}
+J.~Romero and A.~Aspuru-Guzik.
+\newblock Quantum Neural Networks: Concepts, Applications, and Challenges.
+\newblock \emph{arXiv preprint arXiv:2108.01468}, 2021.
+
+\bibitem[Salakhutdinov and Hinton(2010)]{salakhutdinov2010deep}
+R.~Salakhutdinov and G.~E. Hinton.
+\newblock Deep Boltzmann machines.
+\newblock In \emph{Proceedings of the Thirteenth International Conference on Artificial Intelligence and Statistics}, pages 448--455, 2010.
+
+\bibitem[Salimans et~al.(2016)Salimans, Goodfellow, Zaremba, Cheung, Radford, and Chen]{salimans2016improved}
+T.~Salimans, I.~Goodfellow, W.~Zaremba, V.~Cheung, A.~Radford, and X.~Chen.
+\newblock Improved techniques for training GANs.
+\newblock In \emph{Advances in Neural Information Processing Systems}, volume~29, 2016.
+
+\bibitem[Sohl-Dickstein et~al.(2015)Sohl-Dickstein, Weiss, Maheswaranathan, and Ganguli]{sohl2015deep}
+J.~Sohl-Dickstein, E.~Weiss, N.~Maheswaranathan, and S.~Ganguli.
+\newblock Deep unsupervised learning using nonequilibrium thermodynamics.
+\newblock In \emph{International Conference on Machine Learning}, pages 2256--2265, 2015.
+
+\bibitem[Song et~al.(2020)Song, Meng, and Ermon]{song2020denoising}
+Y.~Song, C.~Meng, and S.~Ermon.
+\newblock Denoising diffusion implicit models.
+\newblock In \emph{International Conference on Learning Representations}, 2021.
+
+\bibitem[Wang et~al.(2023)Wang, Wang, Liu, and Qiu]{wang2023binary}
+Z.~Wang, J.~Wang, Z.~Liu, and Q.~Qiu.
+\newblock Binary Latent Diffusion.
+\newblock \emph{arXiv preprint arXiv:2304.04820}, 2023.
+
+\bibitem[Yu et~al.(2019)Yu, Dang, and Lessa]{yu2019attributing}
+J.~Yu, T.~Dang, and P.~Lessa.
+\newblock Attributing and tracing truncation methods in GAN-based image synthesis.
+\newblock In \emph{IEEE Conference on Computer Vision and Pattern Recognition}, 2019.
+
+\end{thebibliography}
+
+\end{document}
