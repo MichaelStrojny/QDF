@@ -1,0 +1,5 @@
+torch
+numpy
+dwave-neal
+dimod
+torchvision
