@@ -3,3 +3,4 @@ numpy
 dwave-neal
 dimod
 torchvision
+torchmetrics

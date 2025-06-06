@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import List
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
 
 try:
     import dimod
@@ -252,6 +254,38 @@ class DBN(nn.Module):
             bias = -torch.log(mean / (1 - mean))
             return bias, cov
 
+class SHDBN(DBN):
+    """Structured Hierarchical DBN with optional skip connections and layer gates."""
+
+    def __init__(self, layer_sizes: List[int], use_skip: bool = True,
+                 use_gates: bool = True, orth_reg: float = 0.0):
+        super().__init__(layer_sizes)
+        self.use_skip = use_skip
+        self.orth_reg = orth_reg
+        self.gates = nn.Parameter(torch.ones(len(self.rbms))) if use_gates else None
+
+    def forward(self, v: torch.Tensor) -> torch.Tensor:
+        h = v
+        prev = v
+        for idx, rbm in enumerate(self.rbms):
+            h = rbm(h)
+            if self.gates is not None:
+                h = torch.sigmoid(self.gates[idx]) * h
+            if self.use_skip and idx > 0:
+                h = h + prev
+            prev = h
+        return h
+
+    def regularization_loss(self) -> torch.Tensor:
+        if self.orth_reg == 0.0:
+            return torch.tensor(0.0, device=self.rbms[0].W.device)
+        loss = 0.0
+        for rbm in self.rbms:
+            W = rbm.W
+            gram = W.t() @ W
+            loss = loss + ((gram - torch.eye(gram.size(0), device=W.device)) ** 2).mean()
+        return self.orth_reg * loss
+
 class BinaryDiffusion:
     def __init__(self, timesteps: int, beta_start: float = 1e-4, beta_end: float = 0.05):
         self.timesteps = timesteps
@@ -260,8 +294,7 @@ class BinaryDiffusion:
     def q_sample(self, z0: torch.Tensor, t: int) -> torch.Tensor:
         beta = self.betas[t]
         flip_mask = torch.rand_like(z0) < beta
-        zt = torch.where(flip_mask, 1 - z0, z0)
-        return zt
+        return torch.where(flip_mask, 1 - z0, z0)
 
     def q_sample_progressive(self, z0: torch.Tensor) -> List[torch.Tensor]:
         z = z0
@@ -271,7 +304,7 @@ class BinaryDiffusion:
             history.append(z)
         return history
 
-def q_posterior_bias(self, zt: torch.Tensor, t: int) -> torch.Tensor:
+    def q_posterior_bias(self, zt: torch.Tensor, t: int) -> torch.Tensor:
         beta = self.betas[t]
         log_ratio = torch.log((1 - beta) / beta)
         return log_ratio * (2 * zt - 1)
@@ -383,6 +416,25 @@ def generate(autoencoder: BinaryAutoencoder, dbn: DBN, diffusion: BinaryDiffusio
         images = autoencoder.decode(z_t.to(device))
     return images
 
+def evaluate_generation(autoencoder: BinaryAutoencoder, dbn: DBN, diffusion: BinaryDiffusion,
+                        real_loader, num_samples: int = 1000, window: int = 5, device: str = 'cuda'):
+    fid = FrechetInceptionDistance(feature=64).to(device)
+    isc = InceptionScore().to(device)
+    count = 0
+    for img, in real_loader:
+        img = img.to(device)
+        fid.update(img * 255.0, real=True)
+        count += img.size(0)
+        if count >= num_samples:
+            break
+    with torch.no_grad():
+        gen = generate(autoencoder, dbn, diffusion, num_samples=num_samples, window=window).to(device)
+    fid.update(gen * 255.0, real=False)
+    isc.update(gen * 255.0)
+    fid_score = fid.compute().item()
+    is_score = isc.compute()[0].item()
+    return fid_score, is_score
+
 def train_autoencoder(autoencoder: BinaryAutoencoder, dataloader, epochs: int = 10,
                       lr: float = 1e-3, device: str = 'cuda'):
     opt = torch.optim.Adam(autoencoder.parameters(), lr=lr)
@@ -399,7 +451,8 @@ def train_autoencoder(autoencoder: BinaryAutoencoder, dataloader, epochs: int = 
 
 
 def train_dbn(dbn: DBN, autoencoder: BinaryAutoencoder, dataloader, epochs: int = 10,
-              lr: float = 1e-3, k: int = 1, device: str = 'cuda'):
+              lr: float = 1e-3, k: int = 1, device: str = 'cuda',
+              joint_window: int = 0, diffusion: BinaryDiffusion | None = None):
     autoencoder.to(device)
     autoencoder.eval()
     codes = []
@@ -407,7 +460,13 @@ def train_dbn(dbn: DBN, autoencoder: BinaryAutoencoder, dataloader, epochs: int 
         for x, in dataloader:
             x = x.to(device)
             h = autoencoder.encode(x)
-            codes.append(torch.sigmoid(h))
+            if joint_window and diffusion is not None:
+                z0 = stochastic_binarize(h)
+                seq = diffusion.q_sample_progressive(z0)[:joint_window]
+                flat = torch.cat(seq, dim=1)
+                codes.append(flat)
+            else:
+                codes.append(torch.sigmoid(h))
     data = torch.cat(codes, dim=0)
     dbn.pretrain(data, epochs=epochs, lr=lr, k=k)
 
@@ -415,12 +474,15 @@ if __name__ == '__main__':
     import argparse
     from torchvision import datasets, transforms
     parser = argparse.ArgumentParser(description='QuDiffuse Training and Generation')
-    parser.add_argument('--dataset', type=str, default='mnist')
+    parser.add_argument('--dataset', type=str, default='mnist', choices=['mnist','cifar10','celeba'])
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--timesteps', type=int, default=100)
     parser.add_argument('--window', type=int, default=5)
     parser.add_argument('--generate', action='store_true')
+    parser.add_argument('--prior', type=str, default='dbn', choices=['dbn','shdbn'])
+    parser.add_argument('--joint-train', type=int, default=0, help='window size for joint training')
+    parser.add_argument('--evaluate', action='store_true')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -428,6 +490,14 @@ if __name__ == '__main__':
         transform = transforms.Compose([transforms.ToTensor()])
         train_set = datasets.MNIST('./data', train=True, download=True, transform=transform)
         input_channels = 1
+    elif args.dataset == 'cifar10':
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_set = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+        input_channels = 3
+    elif args.dataset == 'celeba':
+        transform = transforms.Compose([transforms.CenterCrop(64), transforms.ToTensor()])
+        train_set = datasets.CelebA('./data', split='train', download=True, transform=transform)
+        input_channels = 3
     else:
         raise ValueError('Unknown dataset')
 
@@ -436,9 +506,13 @@ if __name__ == '__main__':
     autoencoder = BinaryAutoencoder(input_channels, latent_dim=1024)
     if not args.generate:
         train_autoencoder(autoencoder, loader, epochs=args.epochs, device=device)
-    dbn = DBN([1024, 2048, 2048])
+    if args.prior == 'dbn':
+        dbn = DBN([1024, 2048, 2048])
+    else:
+        dbn = SHDBN([1024, 2048, 2048, 1024], orth_reg=1e-3)
     if not args.generate:
-        train_dbn(dbn, autoencoder, loader, epochs=args.epochs, device=device)
+        train_dbn(dbn, autoencoder, loader, epochs=args.epochs, device=device,
+                  joint_window=args.joint_train, diffusion=BinaryDiffusion(args.timesteps))
 
     diffusion = BinaryDiffusion(args.timesteps)
 
@@ -447,3 +521,6 @@ if __name__ == '__main__':
         from torchvision.utils import save_image
         save_image(images.cpu(), 'generated.png')
         print('Saved generated image to generated.png')
+        if args.evaluate:
+            fid, isc = evaluate_generation(autoencoder, dbn, diffusion, loader, num_samples=1000, window=args.window, device=device)
+            print(f'FID {fid:.3f} IS {isc:.3f}')
