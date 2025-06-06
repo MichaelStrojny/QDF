@@ -271,23 +271,80 @@ class BinaryDiffusion:
             history.append(z)
         return history
 
-    def q_posterior_bias(self, zt: torch.Tensor, t: int) -> torch.Tensor:
+def q_posterior_bias(self, zt: torch.Tensor, t: int) -> torch.Tensor:
         beta = self.betas[t]
         log_ratio = torch.log((1 - beta) / beta)
         return log_ratio * (2 * zt - 1)
 
-def solve_qubo(Q: np.ndarray, bias: np.ndarray, num_reads: int = 100) -> np.ndarray:
+def qubo_energy(x: np.ndarray, Q: np.ndarray, bias: np.ndarray) -> float:
+    return float(x @ Q @ x + bias @ x)
+
+def tabu_search(initial: np.ndarray, Q: np.ndarray, bias: np.ndarray, iters: int = 100) -> np.ndarray:
+    x = initial.copy()
+    best = x.copy()
+    best_e = qubo_energy(x, Q, bias)
+    tabu: set = set()
+    n = len(x)
+    for _ in range(iters):
+        e_candidates = []
+        for i in range(n):
+            cand = x.copy()
+            cand[i] = 1 - cand[i]
+            key = tuple(cand.tolist())
+            if key in tabu:
+                continue
+            e = qubo_energy(cand, Q, bias)
+            e_candidates.append((e, i, cand))
+        if not e_candidates:
+            break
+        e_candidates.sort(key=lambda t: t[0])
+        e, idx, cand = e_candidates[0]
+        x = cand
+        tabu.add(tuple(x.tolist()))
+        if e < best_e:
+            best_e = e
+            best = x.copy()
+        if len(tabu) > 10 * n:
+            tabu.clear()
+    return best
+
+def solve_qubo(Q: np.ndarray, bias: np.ndarray, num_reads: int = 100, tabu_iters: int = 100,
+               sub_size: int = 2048) -> np.ndarray:
     if dimod is None or SimulatedAnnealingSampler is None:
         raise ImportError('dimod and dwave-neal must be installed')
-    bqm = dimod.BinaryQuadraticModel({i: float(bias[i]) for i in range(len(bias))},
-                                     {(i, j): float(Q[i, j]) for i in range(len(bias)) for j in range(i + 1, len(bias)) if Q[i, j] != 0},
+    n = len(bias)
+    if n > sub_size:
+        return solve_qubo_partitioned(Q, bias, num_reads, tabu_iters, sub_size)
+    bqm = dimod.BinaryQuadraticModel({i: float(bias[i]) for i in range(n)},
+                                     {(i, j): float(Q[i, j]) for i in range(n) for j in range(i + 1, n) if Q[i, j] != 0},
                                      0.0,
                                      vartype=dimod.BINARY)
     sampler = SimulatedAnnealingSampler()
     sampleset = sampler.sample(bqm, num_reads=num_reads)
     sample = sampleset.first.sample
-    result = np.array([sample[i] for i in range(len(bias))], dtype=np.float32)
+    result = np.array([sample[i] for i in range(n)], dtype=np.float32)
+    result = tabu_search(result, Q, bias, iters=tabu_iters)
     return result
+
+def solve_qubo_partitioned(Q: np.ndarray, bias: np.ndarray, num_reads: int, tabu_iters: int,
+                           sub_size: int) -> np.ndarray:
+    n = len(bias)
+    solution = np.random.randint(0, 2, n).astype(np.float32)
+    energy = qubo_energy(solution, Q, bias)
+    for _ in range(10):
+        idx = np.random.choice(n, size=min(sub_size, n), replace=False)
+        others = np.setdiff1d(np.arange(n), idx)
+        Q_sub = Q[np.ix_(idx, idx)]
+        b_sub = bias[idx] + Q[np.ix_(idx, others)] @ solution[others]
+        sub_sol = solve_qubo(Q_sub, b_sub, num_reads=num_reads, tabu_iters=tabu_iters)
+        candidate = solution.copy()
+        candidate[idx] = sub_sol
+        e = qubo_energy(candidate, Q, bias)
+        if e < energy:
+            solution = candidate
+            energy = e
+    return solution
+
 
 def build_joint_qubo(z_t: torch.Tensor, dbn_bias: torch.Tensor, dbn_coupling: torch.Tensor,
                      diffusion: BinaryDiffusion, window: int) -> (np.ndarray, np.ndarray):

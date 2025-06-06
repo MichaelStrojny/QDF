@@ -1,9 +1,11 @@
 # QuDiffuse
 
-QuDiffuse implements the quantum-assisted diffusion model described in `paper.tex`.
-The autoencoder maps images to binary latent codes. A Deep Belief Network (DBN) is
-trained using Contrastive Divergence to model these codes. Denoising is cast as a
-QUBO problem solved with `dwave-neal` during sampling.
+QuDiffuse implements the quantum-assisted diffusion model described in
+`paper.tex`. The autoencoder maps images to binary latent codes. A Deep Belief
+Network (DBN) is trained using Contrastive Divergence to model these codes.
+Denoising is formulated as a QUBO and solved with D-Wave's `dwave-neal`
+simulated annealer. After annealing, a small tabu search refines the solution and
+large QUBOs are automatically partitioned into subproblems when necessary.
 
 ## Requirements
 ```
